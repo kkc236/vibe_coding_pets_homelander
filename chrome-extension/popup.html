@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        width: 230px;
+        margin: 0;
+        padding: 12px;
+        font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+        color: #111827;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 15px;
+      }
+      p {
+        margin: 0 0 10px;
+        color: #4b5563;
+        line-height: 1.45;
+      }
+      button {
+        width: 100%;
+        border: 0;
+        border-radius: 8px;
+        padding: 9px;
+        background: #b91c1c;
+        color: #fff;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      #status {
+        margin-top: 9px;
+        font-size: 12px;
+        color: #6b7280;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>AI Finish Pet Bridge</h1>
+    <p>打开桌宠后，在 ChatGPT / Claude / Gemini 页面会自动监听回答完成。</p>
+    <button id="test">测试提醒</button>
+    <div id="status">等待测试。</div>
+    <script src="popup.js"></script>
+  </body>
+</html>

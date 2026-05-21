@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+pet-token.txt
+pet-settings.json
+listener-snippet.js
+.codex/
+.DS_Store
+Thumbs.db
