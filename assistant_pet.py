@@ -592,9 +592,11 @@ def console_script(token):
     return f"""(() => {{
   const TOKEN = {json.dumps(token)};
   const URL = 'http://127.0.0.1:{PORT}/notify';
+  const IS_GEMINI = location.hostname === 'gemini.google.com';
   let busy = false;
   let lastText = '';
   let stable = 0;
+  let lastChangeAt = 0;
   function text() {{
     const selectors = [
       '[data-message-author-role="assistant"]',
@@ -617,14 +619,17 @@ def console_script(token):
     return (nodes.at(-1)?.innerText || document.body.innerText || '').slice(-5000);
   }}
   function hasStop() {{
-    const pattern = /stop generating|stop responding|stop response|stop|停止生成|停止回答|停止|cancel response|cancel generation|interrupt/i;
+    const pattern = IS_GEMINI
+      ? /(^|\\b)(stop response|stop generating|cancel response|cancel generation|interrupt)(\\b|$)|^\\s*stop\\s*$|停止生成|停止回答|^\\s*停止\\s*$/i
+      : /stop generating|stop responding|stop response|停止生成|停止回答|停止|cancel response|cancel generation|interrupt/i;
     const controls = [...document.querySelectorAll('button, [role="button"], [aria-label], [title]')];
-    if (controls.some((node) => pattern.test([node.innerText, node.getAttribute('aria-label'), node.getAttribute('title')].filter(Boolean).join(' ')))) return true;
-    return pattern.test(document.body.innerText || '');
+    if (controls.some((node) => !!(node.offsetParent || node.getClientRects().length) && pattern.test([node.innerText, node.textContent, node.getAttribute('aria-label'), node.getAttribute('title')].filter(Boolean).join(' ')))) return true;
+    if (IS_GEMINI) return [...document.querySelectorAll('[aria-busy="true"], [role="progressbar"], mat-progress-bar, mat-spinner, .mat-mdc-progress-spinner')].some((node) => !!(node.offsetParent || node.getClientRects().length));
+    return /stop generating|stop responding|stop response|停止生成|停止回答/i.test(document.body.innerText || '');
   }}
   function inputReady() {{
-    const el = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].filter((node) => !!(node.offsetParent || node.getClientRects().length)).at(-1);
-    return !!el && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+    const el = [...document.querySelectorAll('textarea, rich-textarea, .ql-editor, [contenteditable="true"], [role="textbox"]')].filter((node) => !!(node.offsetParent || node.getClientRects().length)).at(-1);
+    return !!el && !el.disabled && el.getAttribute('aria-disabled') !== 'true' && el.getAttribute('contenteditable') !== 'false';
   }}
   async function send(type, message) {{
     await fetch(URL, {{
@@ -634,13 +639,15 @@ def console_script(token):
     }}).catch(() => {{}});
   }}
   setInterval(() => {{
-    const t = text();
+    const t = (text() || '').replace(/\\s+/g, ' ').trim();
     const stop = hasStop();
     const ready = inputReady();
-    if ((stop || !ready) && !busy) {{ busy = true; stable = 0; send('thinking', 'AI is thinking'); }}
+    const changed = t !== lastText && t.length > 20;
+    if (changed) lastChangeAt = Date.now();
+    if ((stop || (IS_GEMINI ? changed : (!ready || changed))) && !busy) {{ busy = true; stable = 0; send('thinking', 'AI is thinking'); }}
     if (busy) {{
       stable = t === lastText ? stable + 1 : 0;
-      if (!stop && ready && stable >= 2 && t.length > 20) {{
+      if (!stop && (IS_GEMINI || ready) && stable >= 3 && Date.now() - lastChangeAt > 1200 && t.length > 20) {{
         busy = false;
         send('success', 'AI answer finished');
       }}

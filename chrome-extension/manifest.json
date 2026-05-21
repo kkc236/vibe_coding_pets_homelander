@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Finish Pet Bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Notify the local AI Finish Pet when an online AI answer appears to finish.",
   "permissions": ["storage"],
   "host_permissions": [
