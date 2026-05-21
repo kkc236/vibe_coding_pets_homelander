@@ -20,6 +20,8 @@ PORT = int(os.environ.get("AI_FINISH_PET_PORT", "8765"))
 HOST = "127.0.0.1"
 CODEX_LOG_PATTERN = re.compile(r"(?:notificationId=turn-|turnId=)([0-9a-f-]{20,})", re.IGNORECASE)
 CODEX_LOG_TIME_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)")
+CLAUDE_IDLE_STATUSES = {"idle", "done", "complete", "completed", "stopped", "exited", "closed"}
+CLAUDE_ACTIVE_STATUSES = {"active", "busy", "running", "working", "thinking", "streaming", "responding"}
 
 
 DEFAULT_SETTINGS = {
@@ -27,6 +29,7 @@ DEFAULT_SETTINGS = {
     "red_flash": True,
     "laser": True,
     "codex_watch": True,
+    "claude_watch": True,
     "intensity": "medium",
     "cooldown_seconds": 5,
 }
@@ -37,7 +40,7 @@ def clean_settings(data):
     if not isinstance(data, dict):
         return settings
 
-    for key in ("sound", "red_flash", "laser", "codex_watch"):
+    for key in ("sound", "red_flash", "laser", "codex_watch", "claude_watch"):
         if key in data:
             settings[key] = bool(data[key])
 
@@ -206,6 +209,253 @@ def codex_watcher():
         time.sleep(0.5)
 
 
+def path_mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def claude_root_candidates():
+    candidates = []
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.append(Path.home() / ".claude")
+
+    seen = set()
+    for path in candidates:
+        key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.exists():
+            yield path
+
+
+def recent_claude_transcripts(limit=24):
+    files = []
+    for root in claude_root_candidates():
+        projects = root / "projects"
+        if not projects.exists():
+            continue
+        try:
+            files.extend(projects.rglob("*.jsonl"))
+        except OSError:
+            continue
+    files.sort(key=path_mtime, reverse=True)
+    return files[:limit]
+
+
+def recent_claude_sessions(limit=24):
+    files = []
+    for root in claude_root_candidates():
+        sessions = root / "sessions"
+        if not sessions.exists():
+            continue
+        try:
+            files.extend(sessions.glob("*.json"))
+        except OSError:
+            continue
+    files.sort(key=path_mtime, reverse=True)
+    return files[:limit]
+
+
+def read_json_file(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def parse_json_line(line):
+    try:
+        return json.loads(line)
+    except Exception:
+        return None
+
+
+def claude_session_status(data):
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("status", "")).strip().lower()
+
+
+def claude_status_active(status):
+    status = str(status or "").strip().lower()
+    if not status:
+        return False
+    if status in CLAUDE_ACTIVE_STATUSES:
+        return True
+    if status in CLAUDE_IDLE_STATUSES:
+        return False
+    return False
+
+
+def claude_tail_active_state(session_paths):
+    cutoff = (time.time() - 6 * 60 * 60) * 1000
+    for path in session_paths:
+        data = read_json_file(path)
+        if not isinstance(data, dict):
+            continue
+        updated_at = data.get("updatedAt") or data.get("startedAt") or 0
+        try:
+            updated_at = float(updated_at)
+        except (TypeError, ValueError):
+            updated_at = 0
+        if updated_at and updated_at < cutoff:
+            continue
+        if claude_status_active(claude_session_status(data)):
+            return True
+    return False
+
+
+def claude_user_prompt_line(data):
+    if not isinstance(data, dict) or data.get("type") != "user":
+        return False
+    if data.get("toolUseResult") or data.get("sourceToolAssistantUUID"):
+        return False
+    message = data.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, list) and content:
+        if all(isinstance(item, dict) and item.get("type") == "tool_result" for item in content):
+            return False
+    return True
+
+
+def claude_complete_line(data):
+    if not isinstance(data, dict):
+        return False
+    if data.get("type") == "system" and data.get("subtype") == "turn_duration":
+        return True
+    if data.get("type") != "assistant":
+        return False
+
+    message = data.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return False
+
+    stop = message.get("stop_reason") or data.get("stop_reason")
+    if stop == "tool_use":
+        return False
+    if stop in ("end_turn", "stop_sequence", "max_tokens"):
+        return True
+
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    has_text = any(isinstance(item, dict) and item.get("type") == "text" and item.get("text", "").strip() for item in content)
+    has_tool = any(isinstance(item, dict) and item.get("type") == "tool_use" for item in content)
+    return has_text and not has_tool
+
+
+def claude_event_id(data, path):
+    if not isinstance(data, dict):
+        return str(hash(path))
+    message = data.get("message") if isinstance(data.get("message"), dict) else {}
+    return (
+        data.get("uuid")
+        or data.get("promptId")
+        or message.get("id")
+        or f"{data.get('sessionId', '')}:{data.get('timestamp', '')}:{path.name}"
+    )
+
+
+def claude_watcher():
+    offsets = {}
+    session_states = {}
+    seen_events = set()
+    synced = False
+    active = False
+
+    while True:
+        if not APP.settings.get("claude_watch", True):
+            synced = False
+            active = False
+            time.sleep(0.5)
+            continue
+
+        transcripts = recent_claude_transcripts()
+        sessions = recent_claude_sessions()
+
+        if not synced:
+            active = claude_tail_active_state(sessions)
+            if active:
+                APP.events.put({"type": "thinking", "source": "Claude Code", "message": "Claude Code is already working"})
+            for path in transcripts:
+                try:
+                    offsets[path] = path.stat().st_size
+                except OSError:
+                    pass
+            for path in sessions:
+                session_states[path] = claude_session_status(read_json_file(path))
+            synced = True
+
+        for path in sessions:
+            status = claude_session_status(read_json_file(path))
+            previous = session_states.get(path)
+            if previous is None:
+                session_states[path] = status
+                continue
+            was_active = claude_status_active(previous)
+            now_active = claude_status_active(status)
+            if now_active and not active:
+                active = True
+                APP.events.put({"type": "thinking", "source": "Claude Code", "message": "Claude Code is working"})
+            elif was_active and status in CLAUDE_IDLE_STATUSES:
+                if active:
+                    APP.events.put({"type": "success", "source": "Claude Code", "message": "Claude Code answer finished"})
+                active = False
+            session_states[path] = status
+
+        for path in transcripts:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+
+            if path not in offsets:
+                offsets[path] = size
+                continue
+            if size < offsets[path]:
+                offsets[path] = 0
+            if size == offsets[path]:
+                continue
+
+            try:
+                with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                    handle.seek(offsets[path])
+                    lines = handle.readlines()
+                    offsets[path] = handle.tell()
+            except OSError:
+                continue
+
+            for line in lines:
+                data = parse_json_line(line)
+                if claude_user_prompt_line(data):
+                    if not active:
+                        APP.events.put({"type": "thinking", "source": "Claude Code", "message": "Claude Code is working"})
+                    active = True
+                    continue
+
+                if not claude_complete_line(data):
+                    continue
+
+                event_id = claude_event_id(data, path)
+                if event_id in seen_events:
+                    continue
+                seen_events.add(event_id)
+                if len(seen_events) > 128:
+                    seen_events = set(list(seen_events)[-64:])
+                if active:
+                    APP.events.put({"type": "success", "source": "Claude Code", "message": "Claude Code answer finished"})
+                active = False
+
+        time.sleep(0.5)
+
+
 class PetState:
     def __init__(self):
         self.settings = self.load_settings()
@@ -248,6 +498,7 @@ def json_response(handler, status, payload):
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Pet-Token")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.send_header("Access-Control-Allow-Private-Network", "true")
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -275,6 +526,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Pet-Token")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
         self.end_headers()
 
     def do_GET(self):
@@ -344,14 +596,34 @@ def console_script(token):
   let lastText = '';
   let stable = 0;
   function text() {{
-    const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"], [data-testid*="assistant"], .markdown, article')];
+    const selectors = [
+      '[data-message-author-role="assistant"]',
+      '[data-testid*="assistant"]',
+      '[data-testid*="bot"]',
+      '[data-testid*="message"]',
+      '[data-testid*="conversation"]',
+      '[data-test-id*="assistant"]',
+      'model-response',
+      'message-content',
+      'message-bubble',
+      '.chat-message',
+      '.model-response-text',
+      '.response-container',
+      '.prose',
+      '.markdown',
+      'article'
+    ];
+    const nodes = [...document.querySelectorAll(selectors.join(','))];
     return (nodes.at(-1)?.innerText || document.body.innerText || '').slice(-5000);
   }}
   function hasStop() {{
-    return /stop generating|stop responding|停止生成|停止回答|stop/i.test(document.body.innerText || '');
+    const pattern = /stop generating|stop responding|stop response|stop|停止生成|停止回答|停止|cancel response|cancel generation|interrupt/i;
+    const controls = [...document.querySelectorAll('button, [role="button"], [aria-label], [title]')];
+    if (controls.some((node) => pattern.test([node.innerText, node.getAttribute('aria-label'), node.getAttribute('title')].filter(Boolean).join(' ')))) return true;
+    return pattern.test(document.body.innerText || '');
   }}
   function inputReady() {{
-    const el = document.querySelector('textarea, [contenteditable="true"]');
+    const el = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].filter((node) => !!(node.offsetParent || node.getClientRects().length)).at(-1);
     return !!el && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
   }}
   async function send(type, message) {{
@@ -409,6 +681,7 @@ class PetApp:
         self.red_flash = tk.BooleanVar(value=APP.settings["red_flash"])
         self.laser = tk.BooleanVar(value=APP.settings["laser"])
         self.codex_watch = tk.BooleanVar(value=APP.settings["codex_watch"])
+        self.claude_watch = tk.BooleanVar(value=APP.settings["claude_watch"])
 
         self.drag = {"mouse_x": 0, "mouse_y": 0, "win_x": 0, "win_y": 0}
         self.activity = "idle"
@@ -460,6 +733,7 @@ class PetApp:
         self.menu.add_checkbutton(label="红屏", variable=self.red_flash, command=self.save_ui_settings)
         self.menu.add_checkbutton(label="眼射激光", variable=self.laser, command=self.save_ui_settings)
         self.menu.add_checkbutton(label="Codex 完成提醒", variable=self.codex_watch, command=self.save_ui_settings)
+        self.menu.add_checkbutton(label="Claude Code 完成提醒", variable=self.claude_watch, command=self.save_ui_settings)
         intensity_menu = tk.Menu(self.menu, tearoff=0)
         for value, label in (("low", "低强度"), ("medium", "中强度"), ("high", "高强度")):
             intensity_menu.add_radiobutton(
@@ -774,6 +1048,7 @@ class PetApp:
         APP.settings["red_flash"] = bool(self.red_flash.get())
         APP.settings["laser"] = bool(self.laser.get())
         APP.settings["codex_watch"] = bool(self.codex_watch.get())
+        APP.settings["claude_watch"] = bool(self.claude_watch.get())
         APP.settings["intensity"] = self.intensity.get()
         APP.save_settings()
         self.show_toast("设置已保存")
@@ -784,6 +1059,7 @@ class PetApp:
         self.red_flash.set(APP.settings["red_flash"])
         self.laser.set(APP.settings["laser"])
         self.codex_watch.set(APP.settings["codex_watch"])
+        self.claude_watch.set(APP.settings["claude_watch"])
         self.intensity.set(APP.settings["intensity"])
 
     def copy_script(self):
@@ -968,6 +1244,7 @@ def main():
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
     threading.Thread(target=codex_watcher, daemon=True).start()
+    threading.Thread(target=claude_watcher, daemon=True).start()
     app = PetApp()
     app.detail.set(f"监听 {HOST}:{PORT}。右键桌宠可复制脚本和调整设置。")
     app.run()

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Finish Pet Bridge",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Notify the local AI Finish Pet when an online AI answer appears to finish.",
   "permissions": ["storage"],
   "host_permissions": [
@@ -9,7 +9,11 @@
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
     "https://claude.ai/*",
-    "https://gemini.google.com/*"
+    "https://gemini.google.com/*",
+    "https://notebooklm.google/*",
+    "https://notebooklm.google.com/*",
+    "https://grok.com/*",
+    "https://x.com/*"
   ],
   "content_scripts": [
     {
@@ -17,12 +21,19 @@
         "https://chatgpt.com/*",
         "https://chat.openai.com/*",
         "https://claude.ai/*",
-        "https://gemini.google.com/*"
+        "https://gemini.google.com/*",
+        "https://notebooklm.google/*",
+        "https://notebooklm.google.com/*",
+        "https://grok.com/*",
+        "https://x.com/i/grok*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "AI Finish Pet Bridge"
